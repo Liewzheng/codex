@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::path::PathBuf;
 
 use codex_protocol::ThreadId;
@@ -18,6 +19,7 @@ use crate::engine::dispatcher;
 use crate::engine::output_parser;
 use crate::schema::NullableString;
 use crate::schema::StopCommandInput;
+use crate::schema::StopMessage;
 use crate::schema::SubagentStopCommandInput;
 
 #[derive(Debug, Clone)]
@@ -30,6 +32,7 @@ pub struct StopRequest {
     pub permission_mode: String,
     pub stop_hook_active: bool,
     pub last_assistant_message: Option<String>,
+    pub messages: Vec<StopMessage>,
     pub target: StopHookTarget,
 }
 
@@ -57,6 +60,78 @@ impl StopHookTarget {
             Self::SubagentStop { agent_type, .. } => Some(agent_type.as_str()),
         }
     }
+}
+
+/// Extract the last user/assistant messages from a Codex JSONL transcript.
+///
+/// Codex transcripts are JSONL files where each line is a wrapped
+/// `ResponseItem`. User and assistant messages have the shape:
+///
+/// ```json
+/// {
+///   "type": "response_item",
+///   "payload": {
+///     "type": "message",
+///     "role": "user" | "assistant",
+///     "content": [
+///       {"type": "input_text" | "output_text", "text": "..."}
+///     ]
+///   }
+/// }
+/// ```
+fn extract_recent_messages_from_transcript(transcript_path: Option<&Path>) -> Vec<StopMessage> {
+    let path = match transcript_path {
+        Some(path) => path,
+        None => return Vec::new(),
+    };
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    let reader = std::io::BufReader::new(file);
+    let mut messages = Vec::new();
+    for line in std::io::BufRead::lines(reader) {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        let envelope: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let item = envelope.get("payload").unwrap_or(&envelope);
+        if item.get("type") != Some(&serde_json::Value::String("message".to_string())) {
+            continue;
+        }
+        let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let content = match item.get("content") {
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .filter_map(|item| {
+                    let item_type = item.get("type").and_then(|v| v.as_str())?;
+                    if item_type != "input_text" && item_type != "output_text" {
+                        return None;
+                    }
+                    item.get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        if !content.is_empty() {
+            messages.push(StopMessage {
+                role: role.to_string(),
+                content,
+            });
+        }
+    }
+    messages.into_iter().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect()
 }
 
 #[derive(Debug, Default)]
@@ -115,6 +190,11 @@ pub(crate) async fn run(
 
     let input_json = match request.target {
         StopHookTarget::Stop => {
+            let messages = if request.messages.is_empty() {
+                extract_recent_messages_from_transcript(request.transcript_path.as_deref())
+            } else {
+                request.messages.clone()
+            };
             let input = StopCommandInput {
                 session_id: request.session_id.to_string(),
                 turn_id: request.turn_id.clone(),
@@ -127,6 +207,7 @@ pub(crate) async fn run(
                 last_assistant_message: NullableString::from_string(
                     request.last_assistant_message.clone(),
                 ),
+                messages: Some(messages),
             };
             match serde_json::to_string(&input) {
                 Ok(input_json) => input_json,
@@ -146,6 +227,14 @@ pub(crate) async fn run(
             agent_type,
             agent_transcript_path,
         } => {
+            let transcript_path = agent_transcript_path
+                .as_deref()
+                .or(request.transcript_path.as_deref());
+            let messages = if request.messages.is_empty() {
+                extract_recent_messages_from_transcript(transcript_path)
+            } else {
+                request.messages.clone()
+            };
             let input = SubagentStopCommandInput {
                 session_id: request.session_id.to_string(),
                 turn_id: request.turn_id.clone(),
@@ -161,6 +250,7 @@ pub(crate) async fn run(
                 last_assistant_message: NullableString::from_string(
                     request.last_assistant_message.clone(),
                 ),
+                messages: Some(messages),
             };
             match serde_json::to_string(&input) {
                 Ok(input_json) => input_json,
@@ -431,6 +521,7 @@ mod tests {
 
     use super::StopHandlerData;
     use super::aggregate_results;
+    use super::extract_recent_messages_from_transcript;
     use super::parse_completed;
     use crate::engine::ConfiguredHandler;
     use crate::engine::command_runner::CommandRunResult;
@@ -628,6 +719,54 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn extract_recent_messages_from_transcript_parses_envelope_items() {
+        use std::io::Write;
+
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let transcript = temp_dir.path().join("transcript.jsonl");
+        {
+            let mut file = std::fs::File::create(&transcript).expect("create transcript");
+            for line in [
+                serde_json::json!({
+                    "timestamp": "2026-06-30T00:00:00.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello"}],
+                    },
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-06-30T00:00:01.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary", "text": "thinking"}],
+                    },
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-06-30T00:00:02.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hi there"}],
+                    },
+                }),
+            ] {
+                writeln!(file, "{}", line).expect("write transcript line");
+            }
+        }
+
+        let messages = extract_recent_messages_from_transcript(Some(&transcript));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, "hi there");
+    }
     fn handler() -> ConfiguredHandler {
         ConfiguredHandler {
             event_name: HookEventName::Stop,

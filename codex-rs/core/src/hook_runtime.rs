@@ -355,6 +355,7 @@ pub(crate) async fn run_turn_stop_hooks(
         permission_mode: hook_permission_mode(turn_context),
         stop_hook_active,
         last_assistant_message,
+        messages: Vec::new(),
         target,
     };
     let hooks = sess.hooks();

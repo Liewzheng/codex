@@ -7,6 +7,22 @@
         "string",
         "null"
       ]
+    },
+    "StopMessage": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "role"
+      ],
+      "type": "object"
     }
   },
   "properties": {
@@ -19,6 +35,12 @@
     },
     "last_assistant_message": {
       "$ref": "#/definitions/NullableString"
+    },
+    "messages": {
+      "items": {
+        "$ref": "#/definitions/StopMessage"
+      },
+      "type": "array"
     },
     "model": {
       "type": "string"

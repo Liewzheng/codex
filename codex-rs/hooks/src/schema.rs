@@ -557,6 +557,13 @@ pub(crate) struct UserPromptSubmitCommandInput {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct StopMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(rename = "stop.command.input")]
 pub(crate) struct StopCommandInput {
     pub session_id: String,
@@ -571,6 +578,8 @@ pub(crate) struct StopCommandInput {
     pub permission_mode: String,
     pub stop_hook_active: bool,
     pub last_assistant_message: NullableString,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<StopMessage>>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -592,6 +601,8 @@ pub(crate) struct SubagentStopCommandInput {
     pub agent_id: String,
     pub agent_type: String,
     pub last_assistant_message: NullableString,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<StopMessage>>,
 }
 
 pub fn write_schema_fixtures(schema_root: &Path) -> anyhow::Result<()> {
